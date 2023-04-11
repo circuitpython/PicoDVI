@@ -19,8 +19,20 @@ bool    dvi_monochrome_tmds = DVI_MONOCHROME_TMDS;
 // We require exclusive use of a DMA IRQ line. (you wouldn't want to share
 // anyway). It's possible in theory to hook both IRQs and have two DVI outs.
 static struct dvi_inst *dma_irq_privdata[2];
-static void dvi_dma0_irq();
-static void dvi_dma1_irq();
+static void dvi_dma0_irq(void);
+static void dvi_dma1_irq(void);
+
+uint32_t static_tmdsbuf[DVI_N_TMDS_BUFFERS][3 * 800 / DVI_SYMBOLS_PER_WORD];
+void* static_queuebuf[4][8 + 1];
+
+static void _queue_init_with_spinlock(queue_t *q, size_t num, uint element_size, uint element_count, uint spinlock_num) {
+    lock_init(&q->core, spinlock_num);
+    q->data = (uint8_t *) static_queuebuf[num];
+    q->element_count = (uint16_t)element_count;
+    q->element_size = (uint16_t)element_size;
+    q->wptr = 0;
+    q->rptr = 0;
+}
 
 void dvi_init(struct dvi_inst *inst, uint spinlock_tmds_queue, uint spinlock_colour_queue) {
 	dvi_timing_state_init(&inst->timing_state);
@@ -34,10 +46,10 @@ void dvi_init(struct dvi_inst *inst, uint spinlock_tmds_queue, uint spinlock_col
 	inst->late_scanline_ctr = 0;
 	inst->tmds_buf_release_next = NULL;
 	inst->tmds_buf_release = NULL;
-	queue_init_with_spinlock(&inst->q_tmds_valid,   sizeof(void*),  8, spinlock_tmds_queue);
-	queue_init_with_spinlock(&inst->q_tmds_free,    sizeof(void*),  8, spinlock_tmds_queue);
-	queue_init_with_spinlock(&inst->q_colour_valid, sizeof(void*),  8, spinlock_colour_queue);
-	queue_init_with_spinlock(&inst->q_colour_free,  sizeof(void*),  8, spinlock_colour_queue);
+	_queue_init_with_spinlock(&inst->q_tmds_valid, 0, sizeof(void*),  8, spinlock_tmds_queue);
+	_queue_init_with_spinlock(&inst->q_tmds_free, 1,   sizeof(void*),  8, spinlock_tmds_queue);
+	_queue_init_with_spinlock(&inst->q_colour_valid, 2, sizeof(void*),  8, spinlock_colour_queue);
+	_queue_init_with_spinlock(&inst->q_colour_free, 3, sizeof(void*),  8, spinlock_colour_queue);
 
 	dvi_setup_scanline_for_vblank(inst->timing, inst->dma_cfg, true, &inst->dma_list_vblank_sync);
 	dvi_setup_scanline_for_vblank(inst->timing, inst->dma_cfg, false, &inst->dma_list_vblank_nosync);
@@ -49,13 +61,7 @@ void dvi_init(struct dvi_inst *inst, uint spinlock_tmds_queue, uint spinlock_col
 	dvi_setup_scanline_for_active(inst->timing, inst->dma_cfg, NULL, &inst->dma_list_error);
 
 	for (int i = 0; i < DVI_N_TMDS_BUFFERS; ++i) {
-		void *tmdsbuf;
-		if (dvi_monochrome_tmds)
-			tmdsbuf = malloc(inst->timing->h_active_pixels / DVI_SYMBOLS_PER_WORD * sizeof(uint32_t));
-		else
-			tmdsbuf = malloc(3 * inst->timing->h_active_pixels / DVI_SYMBOLS_PER_WORD * sizeof(uint32_t));
-		if (!tmdsbuf)
-			panic("TMDS buffer allocation failed");
+		uint32_t* tmdsbuf = static_tmdsbuf[i];
 		queue_add_blocking_u32(&inst->q_tmds_free, &tmdsbuf);
 	}
 }
@@ -65,8 +71,9 @@ void dvi_init(struct dvi_inst *inst, uint spinlock_tmds_queue, uint spinlock_col
 void dvi_register_irqs_this_core(struct dvi_inst *inst, uint irq_num) {
 	uint32_t mask_sync_channel = 1u << inst->dma_cfg[TMDS_SYNC_LANE].chan_data;
 	uint32_t mask_all_channels = 0;
-	for (int i = 0; i < N_TMDS_LANES; ++i)
+	for (int i = 0; i < N_TMDS_LANES; ++i) {
 		mask_all_channels |= 1u << inst->dma_cfg[i].chan_ctrl | 1u << inst->dma_cfg[i].chan_data;
+	}
 
 	dma_hw->ints0 = mask_sync_channel;
 	if (irq_num == DMA_IRQ_0) {
@@ -208,7 +215,7 @@ static void __dvi_func(dvi_dma_irq_handler)(struct dvi_inst *inst) {
 		tmdsbuf = NULL;
 	}
 	else if (queue_try_peek_u32(&inst->q_tmds_valid, &tmdsbuf)) {
-		if (inst->timing_state.v_ctr % dvi_vertical_repeat == dvi_vertical_repeat - 1) {
+		if (inst->timing_state.v_ctr % dvi_vertical_repeat == (uint) dvi_vertical_repeat - 1) {
 			queue_remove_blocking_u32(&inst->q_tmds_valid, &tmdsbuf);
 			inst->tmds_buf_release_next = tmdsbuf;
 		}
@@ -216,7 +223,7 @@ static void __dvi_func(dvi_dma_irq_handler)(struct dvi_inst *inst) {
 	else {
 		// No valid scanline was ready (generates solid red scanline)
 		tmdsbuf = NULL;
-		if (inst->timing_state.v_ctr % dvi_vertical_repeat == dvi_vertical_repeat - 1)
+		if (inst->timing_state.v_ctr % dvi_vertical_repeat == (uint) dvi_vertical_repeat - 1)
 			++inst->late_scanline_ctr;
 	}
 
@@ -229,7 +236,7 @@ static void __dvi_func(dvi_dma_irq_handler)(struct dvi_inst *inst) {
 			else {
 				_dvi_load_dma_op(inst->dma_cfg, &inst->dma_list_error);
 			}
-			if (inst->scanline_callback && inst->timing_state.v_ctr % dvi_vertical_repeat == dvi_vertical_repeat - 1) {
+			if (inst->scanline_callback && inst->timing_state.v_ctr % dvi_vertical_repeat == (uint) dvi_vertical_repeat - 1) {
 				inst->scanline_callback();
 			}
 			break;
