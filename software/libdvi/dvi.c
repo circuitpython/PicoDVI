@@ -22,7 +22,6 @@ static struct dvi_inst *dma_irq_privdata[2];
 static void dvi_dma0_irq(void);
 static void dvi_dma1_irq(void);
 
-uint32_t static_tmdsbuf[DVI_N_TMDS_BUFFERS][3 * 800 / DVI_SYMBOLS_PER_WORD];
 void* static_queuebuf[4][8 + 1];
 
 static void _queue_init_with_spinlock(queue_t *q, size_t num, uint element_size, uint element_count, uint spinlock_num) {
@@ -60,10 +59,7 @@ void dvi_init(struct dvi_inst *inst, uint spinlock_tmds_queue, uint spinlock_col
 #endif
 	dvi_setup_scanline_for_active(inst->timing, inst->dma_cfg, NULL, &inst->dma_list_error);
 
-	for (int i = 0; i < DVI_N_TMDS_BUFFERS; ++i) {
-		uint32_t* tmdsbuf = static_tmdsbuf[i];
-		queue_add_blocking_u32(&inst->q_tmds_free, &tmdsbuf);
-	}
+	// Code calling this will queue up free tmds buffers of the right size.
 }
 
 // The IRQs will run on whichever core calls this function (this is why it's
